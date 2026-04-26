@@ -1,5 +1,6 @@
 import requests
 from datetime import datetime
+import re
 
 from bs4 import BeautifulSoup
 from fake_useragent import UserAgent
@@ -9,10 +10,22 @@ import os
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters, CommandHandler, ConversationHandler
 import json
+import logging
+from telegram.error import BadRequest
 
-from data.pilots_info import INFO
+from data.pilots_info import INFO, TRACKS, TEAMS
+import aiohttp
 
-WAITING_FOR_QUERY = 1
+
+# # Запускаем логгирование
+# logging.basicConfig(
+#     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.DEBUG
+# )
+#
+# logger = logging.getLogger(__name__)
+
+WAITING_FOR_QUERY = "search"
+WAITING_FOR_REMINDER = "reminder"
 
 
 load_dotenv()
@@ -26,9 +39,48 @@ headers = {
 }
 
 
-def find_the_calendar():
-    res = requests.get("https://www.championat.com/auto/_f1/tournament/1032/calendar/", headers=headers)
-    soup = BeautifulSoup(res.text, 'lxml')
+async def start(update, context):
+    user = update.effective_user
+    await update.message.reply_html(
+        rf"Привет {user.mention_html()}! Я бот по формуле 1! Знаю много чего интересного, все функции ты можешь найти по команде /help",
+    )
+    keyboard = [
+        [InlineKeyboardButton("Да", callback_data="yes")],
+        [InlineKeyboardButton("Нет", callback_data="no")]
+    ]
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        'Хочешь установить напоминание о гонках?',
+        reply_markup=reply_markup
+    )
+
+    return WAITING_FOR_REMINDER
+
+async def reminder_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    example = ''
+    choice = query.data  # "yes" или "no"
+    if choice == 'yes':
+        example = 'yes'
+    elif choice == 'no':
+        example = 'no'
+
+    await query.edit_message_text(
+        f"ответ {example}"
+    )
+    return ConversationHandler.END
+
+
+async def find_the_calendar():
+    async with aiohttp.ClientSession() as session:
+        async with session.get("https://www.championat.com/auto/_f1/tournament/1032/calendar/",
+                               headers=headers) as response:
+            res = await response.text()
+    soup = BeautifulSoup(res, 'lxml')
 
     calendar_title = soup.find_all('div', class_='tournament-calendar__title')
     calendar_name = soup.find_all('td', class_='tournament-calendar__name')
@@ -61,19 +113,30 @@ def find_the_calendar():
     return data
 
 
-def find_the_top_leaders():
-    res = requests.get("https://www.championat.com/auto/_f1/tournament/1032/", headers=headers)
-    soup = BeautifulSoup(res.text, 'lxml')
+async def find_the_top_leaders():
+    async with aiohttp.ClientSession() as session:
+        async with session.get("https://www.championat.com/auto/_f1/tournament/1032/",
+                               headers=headers) as response:
+            res = await response.text()
+    soup = BeautifulSoup(res, 'lxml')
+
     top_leaders = soup.find_all(['span', 'td'], class_=['table-item__name', '_right'])
-    ans = ''
+    pilots = []
+    teams = []
     for i in range(0, len(top_leaders), 2):
-        ans += top_leaders[i].text.strip() + '\n' + 'Кол-во очков: ' + top_leaders[i + 1].text.strip() + '\n\n'
-    return ans
+        if re.search(r'[a-zA-Z]', top_leaders[i].text.strip()):
+            teams.append([top_leaders[i].text.strip(), top_leaders[i + 1].text.strip()])
+        else:
+            pilots.append([top_leaders[i].text.strip(), top_leaders[i + 1].text.strip()])
+    return pilots, teams
 
 
-def find_pilots():
-    res = requests.get("https://www.championat.com/auto/_f1/tournament/1032/players/", headers=headers)
-    soup = BeautifulSoup(res.text, 'lxml')
+async def find_pilots():
+    async with aiohttp.ClientSession() as session:
+        async with session.get("https://www.championat.com/auto/_f1/tournament/1032/players/",
+                               headers=headers) as response:
+            res = await response.text()
+    soup = BeautifulSoup(res, 'lxml')
 
     pilots = soup.find_all(['span', 'td'], class_=['table-item__name',
                                                    'table-responsive__row-item _player-team _order_2 _order_mobile_4 _tablet',
@@ -94,7 +157,7 @@ def find_pilots():
 
 
 async def print_the_calendar(update, context):
-    calendar = find_the_calendar()
+    calendar = await find_the_calendar()
     print_data = ''
     for key, data in calendar.items():
         print_data += ' '.join([key, data[0][1], '-', data[-1][1]]) + '\n' + '\n'
@@ -102,11 +165,19 @@ async def print_the_calendar(update, context):
 
 
 async def print_top_leaders(update, context):
-    await update.message.reply_text(find_the_top_leaders())
+    top_pilots, top_teams = await find_the_top_leaders()
+    ans = 'Личный зачёт:\n\n'
+    for leader in top_pilots:
+        ans += f'{leader[0]} -  {leader[1]}\n\n'
+    await update.message.reply_text(ans)
+    ans = 'Командный зачёт:\n\n'
+    for leader in top_teams:
+        ans += f'{leader[0]} -  {leader[1]}\n\n'
+    await update.message.reply_text(ans)
 
 
 async def print_pilots(update, context):
-    pilots = find_pilots()
+    pilots = await find_pilots()
     print_data = ''
     for name, data in pilots.items():
         print_data += name + ' - ' + data['Команда'] + '\n'
@@ -141,6 +212,7 @@ async def search_start(update, context):
         'Сначала выберите категорию поиска:',
         reply_markup=reply_markup
     )
+
     return WAITING_FOR_QUERY
 
 
@@ -185,22 +257,43 @@ async def search_query(update, context):
     # Ищем в соответствующей базе данных
     result = None
     if category == 'stages':
-        calendar = find_the_calendar()
+        calendar = await find_the_calendar()
         for key, data in calendar.items():
             data = '\n\n'.join([stage[0] + ' ' + stage[1] for stage in data])
             if (query.lower() == ' '.join(key.lower().split()[:2])[:-1] or
                     query.lower() in key.lower() or query.lower() in data):
                 result = f'Нашли в календаре:\n {key}\n {data}'
+                key = key.split()[-2] + ' ' + key.split()[-1]
+                try:
+                    await context.bot.send_photo(chat_id=update.message.chat_id,
+                                             photo=f'photo/tracks/{TRACKS[key][0]}', caption=key)
+                except (KeyError, BadRequest):
+                    ...
+                break
     elif category == 'pilots':
-        pilots = find_pilots()
+        pilots = await find_pilots()
         for key, data in pilots.items():
             if query.lower() in key.lower():
                 result = f'{key}\n'
                 for parameter, value in data.items():
                     result += parameter + ': ' + value + '\n'
                 result += INFO[key][1]
-                await context.bot.send_photo(chat_id=update.message.chat_id,
+                try:
+                    await context.bot.send_photo(chat_id=update.message.chat_id,
                                              photo=f'photo/{INFO[key][0]}', caption=key)
+                except (KeyError, BadRequest):
+                    ...
+                break
+    elif category == 'teams':
+        for name_team, data in TEAMS.items():
+            if query.lower() in name_team.lower():
+                result = data[1]
+                try:
+                    await context.bot.send_photo(chat_id=update.message.chat_id,
+                                             photo=f'photo/teams/{data[0]}', caption=name_team)
+                except (KeyError, BadRequest):
+                    ...
+                break
     await update.message.reply_text(f"🔍 Результат по запросу '{query}'\n"
                                     f"{result}")
 
@@ -227,7 +320,8 @@ async def cancel(update, context):
     context.user_data.pop('search_category', None)
     await update.message.reply_text(
         "🔍 Режим поиска выключен.\n"
-        "Чтобы начать снова, напиши /search"
+        "Чтобы начать снова,\n"
+        "напиши /search"
     )
     return ConversationHandler.END
 
@@ -235,7 +329,7 @@ async def cancel(update, context):
 def main():
     application = Application.builder().token(BOT_TOKEN).build()
 
-    conv_handler = ConversationHandler(
+    conv_handler_search = ConversationHandler(
         entry_points=[CommandHandler('search', search_start)],
         states={
             WAITING_FOR_QUERY: [
@@ -247,8 +341,18 @@ def main():
         fallbacks=[CommandHandler('cancel', cancel)],
     )
 
-    # Добавляем обработчики
-    application.add_handler(conv_handler)
+    application.add_handler(conv_handler_search)
+
+    conv_handler_reminder = ConversationHandler(
+        entry_points=[CommandHandler('start', start)],  # start как точка входа
+        states={
+            WAITING_FOR_REMINDER: [
+                CallbackQueryHandler(reminder_callback),  # обработчик кнопок
+            ]
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+    )
+    application.add_handler(conv_handler_reminder)
 
     application.add_handler(CommandHandler("calendar", print_the_calendar))
     application.add_handler(CommandHandler("top_leaders", print_top_leaders))
