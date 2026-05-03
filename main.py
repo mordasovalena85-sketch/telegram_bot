@@ -1,5 +1,5 @@
 import requests
-from datetime import datetime
+import datetime
 import re
 
 from bs4 import BeautifulSoup
@@ -8,10 +8,11 @@ import pprint
 from dotenv import load_dotenv
 import os
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters, CommandHandler, ConversationHandler
+from telegram.ext import Updater, Application, CallbackQueryHandler, MessageHandler, filters,PicklePersistence, CommandHandler, ConversationHandler
 import json
 import logging
 from telegram.error import BadRequest
+import pytz
 
 from data.pilots_info import INFO, TRACKS, TEAMS
 import aiohttp
@@ -26,7 +27,7 @@ import aiohttp
 
 WAITING_FOR_QUERY = "search"
 WAITING_FOR_REMINDER = "reminder"
-
+ASKING_CHOICE = "choise"
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -38,11 +39,19 @@ headers = {
     "User-Agent": random_user_agent
 }
 
+def remove_job_if_exists(name, context):
+    """
+       Удаляет задание с заданным именем.
+    """
+    current_jobs = context.job_queue.get_jobs_by_name(name)
+    if current_jobs:
+        for job in current_jobs:
+            job.schedule_removal()
 
 async def start(update, context):
     user = update.effective_user
     await update.message.reply_html(
-        rf"Привет {user.mention_html()}! Я бот по формуле 1! Знаю много чего интересного, все функции ты можешь найти по команде /help",
+        rf"Привет {user.mention_html()}! Я бот по формуле 1!🏎 Знаю много чего интересного, 🔍все функции ты можешь найти по команде /help",
     )
     keyboard = [
         [InlineKeyboardButton("Да", callback_data="yes")],
@@ -52,7 +61,7 @@ async def start(update, context):
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(
-        'Хочешь установить напоминание о гонках?',
+        '❓Хочешь установить напоминание о гонках?',
         reply_markup=reply_markup
     )
 
@@ -62,17 +71,138 @@ async def reminder_callback(update, context):
     query = update.callback_query
     await query.answer()
 
-    example = ''
     choice = query.data  # "yes" или "no"
+
     if choice == 'yes':
-        example = 'yes'
+        # Переходим к следующему вопросу
+        keyboard = [
+            [InlineKeyboardButton("За неделю", callback_data="choice_week")],
+            [InlineKeyboardButton("За день", callback_data="choice_day")],
+            [InlineKeyboardButton("За час", callback_data="choice_hour")],
+            [InlineKeyboardButton("За неделю + день + час", callback_data="choice_all")]
+        ]
+
+        await query.edit_message_text(
+            "Отлично! Выбери время напоминания:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return ASKING_CHOICE
+
     elif choice == 'no':
-        example = 'no'
+        await query.edit_message_text(
+            "❌ Хорошо, напоминания устанавливать не будем.\n"
+            "Если передумаешь, напиши /start"
+        )
+        return ConversationHandler.END
+
+
+async def choice_time_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    choice = query.data # choice_day, choice_hour или choice_day_and_hour
+    messages = {
+        "choice_week": "📌Я буду присылать напоминание об этапах гонки за неделю)",
+        "choice_day": "📌Я буду присылать напоминание об этапах гонки за день)",
+        "choice_hour": "📌Я буду присылать напоминание об этапах гонки за час)",
+        "choice_all": "📌Я буду присылать напоминание об этапах гонки за неделю, день и час)",
+    }
 
     await query.edit_message_text(
-        f"ответ {example}"
+        f"{messages[choice]}\n\n"
+        f"⚙Чтобы изменить настройки, снова напиши /start"
     )
+
+    chat_id = update.callback_query.message.chat_id
+    remove_job_if_exists(str(chat_id), context)
+
+    moscow_tz = pytz.timezone('Europe/Moscow')
+    context.job_queue.run_daily(reminder_for_the_day, time=datetime.time(hour=18, minute=0, tzinfo=moscow_tz),
+                                data={"chat_id": chat_id, "choice": choice}, name=str(chat_id))
+
+    context.user_data['choice'] = choice
+
     return ConversationHandler.END
+
+async def reminder_for_the_day(context):
+    """Отправляет сообщение-напоминание ."""
+    job_data = context.job.data
+    chat_id = job_data.get("chat_id")
+    choice = job_data.get("choice")
+
+    calendar = await find_the_calendar()
+    with open('calendar.json', 'r', encoding='utf-8') as f:
+        stages = json.load(f)
+    tz = pytz.timezone('Europe/Moscow')
+    current_time = datetime.datetime.now(tz)
+
+    is_print_week, is_print_day = False, False
+    for key, data in stages.items():
+        for stage in data:
+            if ' ' in stage[1] and ':' in stage[1]:
+                event_time = tz.localize(datetime.datetime.strptime(stage[1], "%d.%m.%Y %H:%M"))
+            else:
+                event_time = tz.localize(datetime.datetime.strptime(stage[1], '%d.%m.%Y'))
+            diff = event_time - current_time
+
+            if (choice == 'choice_week' or choice == 'choice_all') and diff.days == 7 and not is_print_week:
+                text = f"🔔НАПОМИНАНИЕ!🔔\n\n❗Через 7 дней!\n{key},\n{stage[0]}\n\n📆Время проведения этапа:\n {stage[1]}"
+                if text:
+                    if chat_id:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=text
+                        )
+                        is_print_week = True
+            if (choice == 'choice_day' or choice == 'choice_all') and diff.days == 1 and not is_print_day:
+                text = f"🔔НАПОМИНАНИЕ!🔔\n\n❗Через 1 день\n{key},\n{stage[0]}\n\n📆Время проведения этапа:\n {stage[1]}"
+                if text:
+                    if chat_id:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=text
+                        )
+                        is_print_day = False
+            if (choice == 'choice_hour' or choice == 'choice_all') and diff.days == 0:
+                time_reminder = event_time - datetime.timedelta(hours=1)
+                job_name = f"{chat_id}_hour_{key}_{stage[0]}"
+                context.job_queue.run_once(reminder_for_the_hour, when=time_reminder,
+                        data={"chat_id": chat_id, "choice": choice, "data": [key, stage]}, name=job_name)
+
+                print('Установил напоминание на', time_reminder)
+
+
+async def reminder_for_the_hour(context):
+    """Отправляет сообщение-напоминание ."""
+    job_data = context.job.data
+    chat_id = job_data.get("chat_id")
+    key, stage = job_data.get("data")
+
+    if chat_id:
+        text = f"🔔НАПОМИНАНИЕ!🔔\n\n❗Остался 1 час!\n{key},\n{stage[0]}\n\n📆Время проведения этапа:\n {stage[1]}"
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text
+        )
+
+
+async def restore_all_reminders(app):
+    """Восстанавливает задания напоминаний после перезапуска бота."""
+    persistence = app.persistence
+    if persistence is None:
+        return
+
+    # Получаем все сохранённые user_data (ключ - chat_id, значение - словарь)
+    all_user_data = getattr(persistence, 'user_data', {})
+
+    for chat_id_str, user_data in all_user_data.items():
+        choice = user_data.get('choice')
+        chat_id = int(chat_id_str)
+        remove_job_if_exists(str(chat_id), app)
+
+        moscow_tz = pytz.timezone('Europe/Moscow')
+        app.job_queue.run_daily(reminder_for_the_day, time=datetime.time(hour=18, minute=0, tzinfo=moscow_tz),
+                                    data={"chat_id": chat_id, "choice": choice}, name=str(chat_id))
 
 
 async def find_the_calendar():
@@ -88,16 +218,16 @@ async def find_the_calendar():
     data = {}
 
     try:
-        last_data = datetime.strptime(calendar_date[0].text.strip(), "%d.%m.%Y %H:%M")
+        last_data = datetime.datetime.strptime(calendar_date[0].text.strip(), "%d.%m.%Y %H:%M")
     except ValueError:
-        last_data = datetime.strptime(calendar_date[0].text.strip(), "%d.%m.%Y")
+        last_data = datetime.datetime.strptime(calendar_date[0].text.strip(), "%d.%m.%Y")
     for line in calendar_title:
         data[line.text.strip()] = []
         while calendar_name:
             try:
-                present_data = datetime.strptime(calendar_date[0].text.strip(), "%d.%m.%Y %H:%M")
+                present_data = datetime.datetime.strptime(calendar_date[0].text.strip(), "%d.%m.%Y %H:%M")
             except ValueError:
-                present_data = datetime.strptime(calendar_date[0].text.strip(), "%d.%m.%Y")
+                present_data = datetime.datetime.strptime(calendar_date[0].text.strip(), "%d.%m.%Y")
 
             days_diff = (present_data - last_data).days
             last_data = present_data
@@ -166,11 +296,11 @@ async def print_the_calendar(update, context):
 
 async def print_top_leaders(update, context):
     top_pilots, top_teams = await find_the_top_leaders()
-    ans = 'Личный зачёт:\n\n'
+    ans = '🏅Личный зачёт:\n\n'
     for leader in top_pilots:
         ans += f'{leader[0]} -  {leader[1]}\n\n'
     await update.message.reply_text(ans)
-    ans = 'Командный зачёт:\n\n'
+    ans = '🏆Командный зачёт:\n\n'
     for leader in top_teams:
         ans += f'{leader[0]} -  {leader[1]}\n\n'
     await update.message.reply_text(ans)
@@ -187,6 +317,7 @@ async def print_pilots(update, context):
 
 async def help(update, context):
     await update.message.reply_text('''
+/start - старт, установление напоминаний\n(/stop_reminder - отмена напоминаний)
 /calendar - расписание этапов
 /top_leaders - очки лидеров
 /pilots - информация о пилотах
@@ -206,9 +337,9 @@ async def search_start(update, context):
     await update.message.reply_text(
         '🔍 Что хотите найти?\n\n'
         'Я могу дать информацию по:\n'
-        '✅ имени пилота\n'
-        '✅ команде\n'
-        '✅ названию этапа/дате/городу проведения\n\n'
+        '✔ имени пилота\n'
+        '✔ команде\n'
+        '✔ названию этапа/дате/городу проведения\n\n'
         'Сначала выберите категорию поиска:',
         reply_markup=reply_markup
     )
@@ -234,7 +365,7 @@ async def button_callback(update, context):
         f"✅ Вы выбрали поиск по категории: {category}!\n\n"
         f"Теперь введите ваш запрос.\n"
         f"Например: {example}\n"
-        f"Для выхода напишите /cancel"
+        f"🔚Для выхода напишите /cancel"
     )
 
     return WAITING_FOR_QUERY
@@ -262,7 +393,7 @@ async def search_query(update, context):
             data = '\n\n'.join([stage[0] + ' ' + stage[1] for stage in data])
             if (query.lower() == ' '.join(key.lower().split()[:2])[:-1] or
                     query.lower() in key.lower() or query.lower() in data):
-                result = f'Нашли в календаре:\n {key}\n {data}'
+                result = f'🏁Нашли в календаре:\n {key}\n {data}'
                 key = key.split()[-2] + ' ' + key.split()[-1]
                 try:
                     await context.bot.send_photo(chat_id=update.message.chat_id,
@@ -308,7 +439,7 @@ async def bad_commands(update, context):
         return await cancel(update, context)
 
     await update.message.reply_text(
-        "Во время поиска доступна только команда /cancel\n"
+        "❗Во время поиска доступна только команда /cancel\n"
         "Введите текст для поиска или /cancel для выхода"
     )
     return WAITING_FOR_QUERY
@@ -326,8 +457,25 @@ async def cancel(update, context):
     return ConversationHandler.END
 
 
+async def stop_reminder(update, context):
+    chat_id = update.effective_chat.id
+    job_name = str(chat_id)
+    removed = remove_job_if_exists(job_name, context)
+
+    # Очищаем сохранённый выбор в user_data (если есть)
+    context.user_data.pop('choice', None)
+
+    if removed:
+        await update.message.reply_text("✅ Напоминания о гонках отключены.")
+    else:
+        await update.message.reply_text("❌ У вас не было активных напоминаний.")
+
+
+
+
 def main():
-    application = Application.builder().token(BOT_TOKEN).build()
+    persistence = PicklePersistence(filepath="bot_data.pickle")
+    application = Application.builder().token(BOT_TOKEN).persistence(persistence).post_init(restore_all_reminders).build()
 
     conv_handler_search = ConversationHandler(
         entry_points=[CommandHandler('search', search_start)],
@@ -348,6 +496,9 @@ def main():
         states={
             WAITING_FOR_REMINDER: [
                 CallbackQueryHandler(reminder_callback),  # обработчик кнопок
+            ],
+            ASKING_CHOICE: [
+                CallbackQueryHandler(choice_time_callback)
             ]
         },
         fallbacks=[CommandHandler('cancel', cancel)],
@@ -358,6 +509,7 @@ def main():
     application.add_handler(CommandHandler("top_leaders", print_top_leaders))
     application.add_handler(CommandHandler("pilots", print_pilots))
     application.add_handler(CommandHandler("help", help))
+    application.add_handler(CommandHandler("stop_reminder", stop_reminder))
 
     application.run_polling()
 
