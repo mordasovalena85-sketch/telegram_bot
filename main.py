@@ -1,4 +1,3 @@
-import requests
 import datetime
 import re
 
@@ -8,7 +7,8 @@ import pprint
 from dotenv import load_dotenv
 import os
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Updater, Application, CallbackQueryHandler, MessageHandler, filters,PicklePersistence, CommandHandler, ConversationHandler
+from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters, PicklePersistence, CommandHandler, \
+    ConversationHandler
 import json
 import logging
 from telegram.error import BadRequest
@@ -16,7 +16,6 @@ import pytz
 
 from data.pilots_info import INFO, TRACKS, TEAMS
 import aiohttp
-
 
 # # Запускаем логгирование
 # logging.basicConfig(
@@ -39,14 +38,25 @@ headers = {
     "User-Agent": random_user_agent
 }
 
+
 def remove_job_if_exists(name, context):
     """
        Удаляет задание с заданным именем.
     """
     current_jobs = context.job_queue.get_jobs_by_name(name)
+    job_name = f"{name}_hour"
+    current_hour_jobs = context.job_queue.get_jobs_by_name(job_name)
+    is_deleted = False
     if current_jobs:
         for job in current_jobs:
             job.schedule_removal()
+            is_deleted = True
+    if current_hour_jobs:
+        for job in current_hour_jobs:
+            job.schedule_removal()
+            is_deleted = True
+    return is_deleted
+
 
 async def start(update, context):
     user = update.effective_user
@@ -66,6 +76,7 @@ async def start(update, context):
     )
 
     return WAITING_FOR_REMINDER
+
 
 async def reminder_callback(update, context):
     query = update.callback_query
@@ -100,7 +111,7 @@ async def choice_time_callback(update, context):
     query = update.callback_query
     await query.answer()
 
-    choice = query.data # choice_day, choice_hour или choice_day_and_hour
+    choice = query.data  # choice_day, choice_hour или choice_day_and_hour
     messages = {
         "choice_week": "📌Я буду присылать напоминание об этапах гонки за неделю)",
         "choice_day": "📌Я буду присылать напоминание об этапах гонки за день)",
@@ -114,15 +125,16 @@ async def choice_time_callback(update, context):
     )
 
     chat_id = update.callback_query.message.chat_id
-    remove_job_if_exists(str(chat_id), context)
+    r = remove_job_if_exists(str(chat_id), context)
 
     moscow_tz = pytz.timezone('Europe/Moscow')
-    context.job_queue.run_daily(reminder_for_the_day, time=datetime.time(hour=18, minute=0, tzinfo=moscow_tz),
+    context.job_queue.run_daily(reminder_for_the_day, time=datetime.time(hour=12, minute=0, tzinfo=moscow_tz),
                                 data={"chat_id": chat_id, "choice": choice}, name=str(chat_id))
 
     context.user_data['choice'] = choice
 
     return ConversationHandler.END
+
 
 async def reminder_for_the_day(context):
     """Отправляет сообщение-напоминание ."""
@@ -130,7 +142,8 @@ async def reminder_for_the_day(context):
     chat_id = job_data.get("chat_id")
     choice = job_data.get("choice")
 
-    calendar = await find_the_calendar()
+    if not os.path.exists('calendar.json'):
+        await find_the_calendar(context)
     with open('calendar.json', 'r', encoding='utf-8') as f:
         stages = json.load(f)
     tz = pytz.timezone('Europe/Moscow')
@@ -146,7 +159,7 @@ async def reminder_for_the_day(context):
             diff = event_time - current_time
 
             if (choice == 'choice_week' or choice == 'choice_all') and diff.days == 7 and not is_print_week:
-                text = f"🔔НАПОМИНАНИЕ!🔔\n\n❗Через 7 дней!\n{key},\n{stage[0]}\n\n📆Время проведения этапа:\n {stage[1]}"
+                text = f"🔔НАПОМИНАНИЕ!🔔\n\n❗Через 7 дней❗\n{key},\n{stage[0]}\n\n📆Время проведения этапа:\n {stage[1]}"
                 if text:
                     if chat_id:
                         await context.bot.send_message(
@@ -155,21 +168,20 @@ async def reminder_for_the_day(context):
                         )
                         is_print_week = True
             if (choice == 'choice_day' or choice == 'choice_all') and diff.days == 1 and not is_print_day:
-                text = f"🔔НАПОМИНАНИЕ!🔔\n\n❗Через 1 день\n{key},\n{stage[0]}\n\n📆Время проведения этапа:\n {stage[1]}"
+                text = f"🔔НАПОМИНАНИЕ!🔔\n\n❗Через 1 день❗\n{key},\n{stage[0]}\n\n📆Время проведения этапа:\n {stage[1]}"
                 if text:
                     if chat_id:
                         await context.bot.send_message(
                             chat_id=chat_id,
                             text=text
                         )
-                        is_print_day = False
+                        is_print_day = True
             if (choice == 'choice_hour' or choice == 'choice_all') and diff.days == 0:
                 time_reminder = event_time - datetime.timedelta(hours=1)
-                job_name = f"{chat_id}_hour_{key}_{stage[0]}"
+                job_name = f"{chat_id}_hour"
                 context.job_queue.run_once(reminder_for_the_hour, when=time_reminder,
-                        data={"chat_id": chat_id, "choice": choice, "data": [key, stage]}, name=job_name)
-
-                print('Установил напоминание на', time_reminder)
+                                           data={"chat_id": chat_id, "choice": choice, "data": [key, stage]},
+                                           name=job_name)
 
 
 async def reminder_for_the_hour(context):
@@ -179,7 +191,7 @@ async def reminder_for_the_hour(context):
     key, stage = job_data.get("data")
 
     if chat_id:
-        text = f"🔔НАПОМИНАНИЕ!🔔\n\n❗Остался 1 час!\n{key},\n{stage[0]}\n\n📆Время проведения этапа:\n {stage[1]}"
+        text = f"🔔НАПОМИНАНИЕ!🔔\n\n❗Остался 1 час❗\n{key},\n{stage[0]}\n\n📆Время проведения этапа:\n {stage[1]}"
         await context.bot.send_message(
             chat_id=chat_id,
             text=text
@@ -197,15 +209,17 @@ async def restore_all_reminders(app):
 
     for chat_id_str, user_data in all_user_data.items():
         choice = user_data.get('choice')
+        if not choice:
+            continue
         chat_id = int(chat_id_str)
-        remove_job_if_exists(str(chat_id), app)
+        r = remove_job_if_exists(str(chat_id), app)
 
         moscow_tz = pytz.timezone('Europe/Moscow')
-        app.job_queue.run_daily(reminder_for_the_day, time=datetime.time(hour=18, minute=0, tzinfo=moscow_tz),
-                                    data={"chat_id": chat_id, "choice": choice}, name=str(chat_id))
+        app.job_queue.run_daily(reminder_for_the_day, time=datetime.time(hour=12, minute=0, tzinfo=moscow_tz),
+                                data={"chat_id": chat_id, "choice": choice}, name=str(chat_id))
 
 
-async def find_the_calendar():
+async def find_the_calendar(context):
     async with aiohttp.ClientSession() as session:
         async with session.get("https://www.championat.com/auto/_f1/tournament/1032/calendar/",
                                headers=headers) as response:
@@ -240,10 +254,9 @@ async def find_the_calendar():
                 break
     with open('calendar.json', 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
-    return data
 
 
-async def find_the_top_leaders():
+async def find_the_top_leaders(context):
     async with aiohttp.ClientSession() as session:
         async with session.get("https://www.championat.com/auto/_f1/tournament/1032/",
                                headers=headers) as response:
@@ -251,14 +264,16 @@ async def find_the_top_leaders():
     soup = BeautifulSoup(res, 'lxml')
 
     top_leaders = soup.find_all(['span', 'td'], class_=['table-item__name', '_right'])
-    pilots = []
-    teams = []
+    data = {}
+    data['pilots'] = {}
+    data['teams'] = {}
     for i in range(0, len(top_leaders), 2):
         if re.search(r'[a-zA-Z]', top_leaders[i].text.strip()):
-            teams.append([top_leaders[i].text.strip(), top_leaders[i + 1].text.strip()])
+            data['teams'][top_leaders[i].text.strip()] = top_leaders[i + 1].text.strip()
         else:
-            pilots.append([top_leaders[i].text.strip(), top_leaders[i + 1].text.strip()])
-    return pilots, teams
+            data['pilots'][top_leaders[i].text.strip()] = top_leaders[i + 1].text.strip()
+    with open('leaders.json', 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
 
 
 async def find_pilots():
@@ -286,8 +301,30 @@ async def find_pilots():
     return ans
 
 
+async def upcoming_event():
+    tz = pytz.timezone('Europe/Moscow')
+    current_time = datetime.datetime.now(tz)
+    with open('calendar.json', 'r', encoding='utf-8') as f:
+        calendar = json.load(f)
+    differences = []
+    for key, data in calendar.items():
+        for stage in data:
+            if ' ' in stage[1] and ':' in stage[1]:
+                event_time = tz.localize(datetime.datetime.strptime(stage[1], "%d.%m.%Y %H:%M"))
+            else:
+                event_time = tz.localize(datetime.datetime.strptime(stage[1], '%d.%m.%Y'))
+            diff = event_time - current_time
+            differences.append(abs(diff))
+    return min(differences).seconds / 3600
+
+
 async def print_the_calendar(update, context):
-    calendar = await find_the_calendar()
+    if not os.path.exists('calendar.json'):
+        await find_the_calendar(context)
+    if await upcoming_event() < 1:
+        await find_the_calendar(context)
+    with open('calendar.json', 'r', encoding='utf-8') as f:
+        calendar = json.load(f)
     print_data = ''
     for key, data in calendar.items():
         print_data += ' '.join([key, data[0][1], '-', data[-1][1]]) + '\n' + '\n'
@@ -295,14 +332,21 @@ async def print_the_calendar(update, context):
 
 
 async def print_top_leaders(update, context):
-    top_pilots, top_teams = await find_the_top_leaders()
+    if not os.path.exists('calendar.json'):
+        await find_the_top_leaders(context)
+    if await upcoming_event() < 1:
+        await find_the_top_leaders(context)
+    with open('leaders.json', 'r', encoding='utf-8') as f:
+        leaders = json.load(f)
+
+    top_pilots, top_teams = leaders['pilots'], leaders['teams']
     ans = '🏅Личный зачёт:\n\n'
-    for leader in top_pilots:
-        ans += f'{leader[0]} -  {leader[1]}\n\n'
+    for name, points in top_pilots.items():
+        ans += f'{name} -  {points}\n\n'
     await update.message.reply_text(ans)
     ans = '🏆Командный зачёт:\n\n'
-    for leader in top_teams:
-        ans += f'{leader[0]} -  {leader[1]}\n\n'
+    for name, points in top_teams.items():
+        ans += f'{name} -  {points}\n\n'
     await update.message.reply_text(ans)
 
 
@@ -388,7 +432,10 @@ async def search_query(update, context):
     # Ищем в соответствующей базе данных
     result = None
     if category == 'stages':
-        calendar = await find_the_calendar()
+        if not os.path.exists('calendar.json'):
+            await find_the_calendar(context)
+        with open('calendar.json', 'r', encoding='utf-8') as f:
+            calendar = json.load(f)
         for key, data in calendar.items():
             data = '\n\n'.join([stage[0] + ' ' + stage[1] for stage in data])
             if (query.lower() == ' '.join(key.lower().split()[:2])[:-1] or
@@ -397,7 +444,7 @@ async def search_query(update, context):
                 key = key.split()[-2] + ' ' + key.split()[-1]
                 try:
                     await context.bot.send_photo(chat_id=update.message.chat_id,
-                                             photo=f'photo/tracks/{TRACKS[key][0]}', caption=key)
+                                                 photo=f'photo/tracks/{TRACKS[key][0]}', caption=key)
                 except (KeyError, BadRequest):
                     ...
                 break
@@ -411,7 +458,7 @@ async def search_query(update, context):
                 result += INFO[key][1]
                 try:
                     await context.bot.send_photo(chat_id=update.message.chat_id,
-                                             photo=f'photo/{INFO[key][0]}', caption=key)
+                                                 photo=f'photo/pilots/{INFO[key][0]}', caption=key)
                 except (KeyError, BadRequest):
                     ...
                 break
@@ -421,7 +468,7 @@ async def search_query(update, context):
                 result = data[1]
                 try:
                     await context.bot.send_photo(chat_id=update.message.chat_id,
-                                             photo=f'photo/teams/{data[0]}', caption=name_team)
+                                                 photo=f'photo/teams/{data[0]}', caption=name_team)
                 except (KeyError, BadRequest):
                     ...
                 break
@@ -471,11 +518,10 @@ async def stop_reminder(update, context):
         await update.message.reply_text("❌ У вас не было активных напоминаний.")
 
 
-
-
 def main():
     persistence = PicklePersistence(filepath="bot_data.pickle")
-    application = Application.builder().token(BOT_TOKEN).persistence(persistence).post_init(restore_all_reminders).build()
+    application = Application.builder().token(BOT_TOKEN).persistence(persistence).post_init(
+        restore_all_reminders).build()
 
     conv_handler_search = ConversationHandler(
         entry_points=[CommandHandler('search', search_start)],
@@ -510,6 +556,18 @@ def main():
     application.add_handler(CommandHandler("pilots", print_pilots))
     application.add_handler(CommandHandler("help", help))
     application.add_handler(CommandHandler("stop_reminder", stop_reminder))
+
+    application.job_queue.run_repeating(
+        find_the_calendar,
+        interval=3600,  # раз в час
+        first=10
+    )
+
+    application.job_queue.run_repeating(
+        find_the_top_leaders,
+        interval=3600,  # раз в час
+        first=10
+    )
 
     application.run_polling()
 
