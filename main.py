@@ -1,9 +1,11 @@
 import datetime
 import re
+import random
+from urllib.parse import urljoin
+
 
 from bs4 import BeautifulSoup
 from fake_useragent import UserAgent
-import pprint
 from dotenv import load_dotenv
 import os
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -14,7 +16,7 @@ import logging
 from telegram.error import BadRequest
 import pytz
 
-from data.pilots_info import INFO, TRACKS, TEAMS
+from data.data import PILOTS, TRACKS, TEAMS
 import aiohttp
 
 # # Запускаем логгирование
@@ -26,7 +28,9 @@ import aiohttp
 
 WAITING_FOR_QUERY = "search"
 WAITING_FOR_REMINDER = "reminder"
-ASKING_CHOICE = "choise"
+ASKING_CHOICE = "choice"
+WAITING_FOR_GAME = "game"
+CHECKING_RESPONSE = 0
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -144,6 +148,8 @@ async def reminder_for_the_day(context):
 
     if not os.path.exists('calendar.json'):
         await find_the_calendar(context)
+    elif await upcoming_event() < 1:
+        await find_the_calendar(context)
     with open('calendar.json', 'r', encoding='utf-8') as f:
         stages = json.load(f)
     tz = pytz.timezone('Europe/Moscow')
@@ -209,6 +215,7 @@ async def restore_all_reminders(app):
 
     for chat_id_str, user_data in all_user_data.items():
         choice = user_data.get('choice')
+        print(choice)
         if not choice:
             continue
         chat_id = int(chat_id_str)
@@ -218,6 +225,12 @@ async def restore_all_reminders(app):
         app.job_queue.run_daily(reminder_for_the_day, time=datetime.time(hour=12, minute=0, tzinfo=moscow_tz),
                                 data={"chat_id": chat_id, "choice": choice}, name=str(chat_id))
 
+        is_subscribe = user_data.get('subscribe_to_news')
+        print(is_subscribe)
+        if is_subscribe:
+            print('восстановили subscribe_to_news')
+            app.job_queue.run_repeating(newsletter, interval=600, first=5,
+                                            data={"chat_id": chat_id}, name=f'news_{str(chat_id)}')
 
 async def find_the_calendar(context):
     async with aiohttp.ClientSession() as session:
@@ -258,25 +271,25 @@ async def find_the_calendar(context):
 
 async def find_the_top_leaders(context):
     async with aiohttp.ClientSession() as session:
-        async with session.get("https://www.championat.com/auto/_f1/tournament/1032/",
+        async with session.get("https://www.championat.com/auto/_f1/tournament/1032/standing/",
                                headers=headers) as response:
             res = await response.text()
     soup = BeautifulSoup(res, 'lxml')
 
-    top_leaders = soup.find_all(['span', 'td'], class_=['table-item__name', '_right'])
+    top_leaders = soup.find_all(['span', 'td'], class_=['table-item__name', 'points-table__total _nohover _fixed-column'])
     data = {}
     data['pilots'] = {}
     data['teams'] = {}
     for i in range(0, len(top_leaders), 2):
         if re.search(r'[a-zA-Z]', top_leaders[i].text.strip()):
             data['teams'][top_leaders[i].text.strip()] = top_leaders[i + 1].text.strip()
-        else:
+        elif not top_leaders[i].text.strip().isdigit():
             data['pilots'][top_leaders[i].text.strip()] = top_leaders[i + 1].text.strip()
     with open('leaders.json', 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
 
 
-async def find_pilots():
+async def find_pilots(context):
     async with aiohttp.ClientSession() as session:
         async with session.get("https://www.championat.com/auto/_f1/tournament/1032/players/",
                                headers=headers) as response:
@@ -288,17 +301,19 @@ async def find_pilots():
                                                    'table-responsive__row-item _right _order_5 _desktop',
                                                    'table-responsive__row-item _right _w-5 _order_6 _desktop',
                                                    'table-responsive__row-item _right _w-5 _order_7 _desktop'])
-    ans = {}
+    data = {}
     for i in range(0, len(pilots), 5):
-        ans[pilots[i].text.strip()] = {}
-        ans[pilots[i].text.strip()]['Команда'] = pilots[i + 1].text.strip()
-        ans[pilots[i].text.strip()]['День рождения'] = pilots[i + 2].text.strip()
+        data[pilots[i].text.strip()] = {}
+        data[pilots[i].text.strip()]['Команда'] = pilots[i + 1].text.strip()
+        data[pilots[i].text.strip()]['День рождения'] = pilots[i + 2].text.strip()
         if pilots[i + 3].text.strip():
-            ans[pilots[i].text.strip()]['Рост'] = pilots[i + 3].text.strip()
+            data[pilots[i].text.strip()]['Рост'] = pilots[i + 3].text.strip()
         if pilots[i + 4].text.strip():
-            ans[pilots[i].text.strip()]['Вес'] = pilots[i + 4].text.strip()
-    ans = dict(sorted(ans.items()))
-    return ans
+            data[pilots[i].text.strip()]['Вес'] = pilots[i + 4].text.strip()
+    data = dict(sorted(data.items()))
+    with open('pilots.json', 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+
 
 
 async def upcoming_event():
@@ -321,7 +336,7 @@ async def upcoming_event():
 async def print_the_calendar(update, context):
     if not os.path.exists('calendar.json'):
         await find_the_calendar(context)
-    if await upcoming_event() < 1:
+    elif await upcoming_event() < 1:
         await find_the_calendar(context)
     with open('calendar.json', 'r', encoding='utf-8') as f:
         calendar = json.load(f)
@@ -332,9 +347,9 @@ async def print_the_calendar(update, context):
 
 
 async def print_top_leaders(update, context):
-    if not os.path.exists('calendar.json'):
+    if not os.path.exists('leaders.json'):
         await find_the_top_leaders(context)
-    if await upcoming_event() < 1:
+    elif await upcoming_event() < 1:
         await find_the_top_leaders(context)
     with open('leaders.json', 'r', encoding='utf-8') as f:
         leaders = json.load(f)
@@ -351,7 +366,10 @@ async def print_top_leaders(update, context):
 
 
 async def print_pilots(update, context):
-    pilots = await find_pilots()
+    if not os.path.exists('pilots.json'):
+        await find_pilots(context)
+    with open('pilots.json', 'r', encoding='utf-8') as f:
+        pilots = json.load(f)
     print_data = ''
     for name, data in pilots.items():
         print_data += name + ' - ' + data['Команда'] + '\n'
@@ -361,11 +379,15 @@ async def print_pilots(update, context):
 
 async def help(update, context):
     await update.message.reply_text('''
-/start - старт, установление напоминаний\n(/stop_reminder - отмена напоминаний)
+/start - старт, установление напоминаний
+(/stop_reminder - отмена напоминаний)
 /calendar - расписание этапов
 /top_leaders - очки лидеров
 /pilots - информация о пилотах
-/search - поиск(/cancel - завершение поиска)
+/play - игра "Угадай трассу по схеме"
+/subscribe_to_news - подписка на новостную рассылку
+/search - поиск
+/cancel - завершение поиска/старта
 /help - помощь''')
 
 
@@ -434,31 +456,37 @@ async def search_query(update, context):
     if category == 'stages':
         if not os.path.exists('calendar.json'):
             await find_the_calendar(context)
+        elif await upcoming_event() < 1:
+            await find_the_calendar(context)
         with open('calendar.json', 'r', encoding='utf-8') as f:
             calendar = json.load(f)
         for key, data in calendar.items():
             data = '\n\n'.join([stage[0] + ' ' + stage[1] for stage in data])
+            # query.lower() == ' '.join(key.lower().split()[:2])[:-1] -> номер этапа(этап 1, этап 12 и т.д.)
             if (query.lower() == ' '.join(key.lower().split()[:2])[:-1] or
                     query.lower() in key.lower() or query.lower() in data):
                 result = f'🏁Нашли в календаре:\n {key}\n {data}'
-                key = key.split()[-2] + ' ' + key.split()[-1]
+                key = key.split('. ')[1] # отделяем название города и страну
                 try:
                     await context.bot.send_photo(chat_id=update.message.chat_id,
-                                                 photo=f'photo/tracks/{TRACKS[key][0]}', caption=key)
+                                                 photo=f'photo/tracks/{TRACKS[key]}', caption=key)
                 except (KeyError, BadRequest):
                     ...
                 break
     elif category == 'pilots':
-        pilots = await find_pilots()
+        if not os.path.exists('pilots.json'):
+            await find_pilots(context)
+        with open('pilots.json', 'r', encoding='utf-8') as f:
+            pilots = json.load(f)
         for key, data in pilots.items():
             if query.lower() in key.lower():
                 result = f'{key}\n'
                 for parameter, value in data.items():
                     result += parameter + ': ' + value + '\n'
-                result += INFO[key][1]
+                result += PILOTS[key][1]
                 try:
                     await context.bot.send_photo(chat_id=update.message.chat_id,
-                                                 photo=f'photo/pilots/{INFO[key][0]}', caption=key)
+                                                 photo=f'photo/pilots/{PILOTS[key][0]}', caption=key)
                 except (KeyError, BadRequest):
                     ...
                 break
@@ -472,6 +500,8 @@ async def search_query(update, context):
                 except (KeyError, BadRequest):
                     ...
                 break
+    if result is None:
+        result = "❌ Ничего не найдено."
     await update.message.reply_text(f"🔍 Результат по запросу '{query}'\n"
                                     f"{result}")
 
@@ -481,25 +511,31 @@ async def search_query(update, context):
 
 async def bad_commands(update, context):
     command = update.message.text
-
     if command == '/cancel':
         return await cancel(update, context)
-
     await update.message.reply_text(
         "❗Во время поиска доступна только команда /cancel\n"
         "Введите текст для поиска или /cancel для выхода"
     )
     return WAITING_FOR_QUERY
 
+async def bad_game_commands(update, context):
+    command = update.message.text
+    if command == '/cancel':
+        return await cancel(update, context)
+    await update.message.reply_text(
+        "❗Во время игры доступна только команда /cancel\n"
+        "Продолжайте игру или напишите /cancel для выхода"
+    )
+    return CHECKING_RESPONSE
 
 async def cancel(update, context):
     """Выход из режима поиска"""
     # Очищаем выбранную категорию
     context.user_data.pop('search_category', None)
+    context.user_data.pop('right_answer', None)
     await update.message.reply_text(
-        "🔍 Режим поиска выключен.\n"
-        "Чтобы начать снова,\n"
-        "напиши /search"
+        "❌Отмена диалога"
     )
     return ConversationHandler.END
 
@@ -517,6 +553,148 @@ async def stop_reminder(update, context):
     else:
         await update.message.reply_text("❌ У вас не было активных напоминаний.")
 
+
+async def send_new_question(update, context):
+    """Генерирует новый вопрос и отправляет его пользователю."""
+    # Выбираем 3 случайные трассы
+    random_tracks = random.sample(list(TRACKS), 3)
+    right_answer = random.choice(random_tracks)
+    context.user_data['right_answer'] = right_answer
+
+    keyboard = [
+        [InlineKeyboardButton(f'{random_tracks[0]}', callback_data=f"{random_tracks[0]}")],
+        [InlineKeyboardButton(f'{random_tracks[1]}', callback_data=f"{random_tracks[1]}")],
+        [InlineKeyboardButton(f'{random_tracks[2]}', callback_data=f"{random_tracks[2]}")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await context.bot.send_photo(
+        chat_id=update.effective_chat.id,
+        photo=f'photo/tracks/{TRACKS[right_answer]}',
+        caption="В какой стране находится эта трасса?",
+        reply_markup=reply_markup
+    )
+
+
+async def game_start(update, context):
+    await update.message.reply_text(
+        "Твоя задача отгадать страну, где находятся трассы!\n"
+        "Я буду отправлять тебе фотографии, а ты из предложенных вариантов должен выбрать правильный!\n"
+        "Чем больше подряд отгадаешь, тем лучше!"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("Да", callback_data="yes")],
+        [InlineKeyboardButton("Нет", callback_data="no")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        '❓ Начнём игру?',
+        reply_markup=reply_markup
+    )
+    return WAITING_FOR_GAME
+
+async def play_game(update, context):
+    """Обрабатывает нажатие 'Да' или 'Нет' на старте"""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == 'yes':
+        await query.edit_message_text("Игра началась!")
+        await send_new_question(update, context)
+        return CHECKING_RESPONSE
+
+    elif query.data == 'no':
+        await query.edit_message_text("❌ Если захочешь поиграть, напиши /play")
+        return ConversationHandler.END
+
+async def checking_response(update, context):
+    """Проверяет ответ пользователя и сразу задаёт следующий вопрос."""
+    query = update.callback_query
+    await query.answer()
+
+    right_answer = context.user_data.get('right_answer')
+    user_answer = query.data
+
+    if user_answer == right_answer:
+        await query.message.reply_text("✅ Правильно!")
+    else:
+        await query.message.reply_text(f"❌ Не угадал. Правильный ответ: {right_answer}")
+
+    await send_new_question(update, context)
+    return CHECKING_RESPONSE
+
+async def subscribe_to_news(update, context):
+    chat_id = update.effective_chat.id
+
+    await update.message.reply_text('Ты подписался на новостную рассылку! Чтобы отписаться напиши /unsubscribe_from_news')
+
+    jobs = context.job_queue.get_jobs_by_name(f'news_{str(chat_id)}')
+    if jobs:
+        for job in jobs:
+            job.schedule_removal()
+    context.job_queue.run_repeating(newsletter, interval=600, first=5,
+                                data={"chat_id": chat_id}, name=f'news_{str(chat_id)}')
+    context.user_data['subscribe_to_news'] = True
+
+async def newsletter(context):
+    job_data = context.job.data
+    chat_id = job_data.get("chat_id")
+
+    news_random_user_agent = ua.random
+    news_headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "User-Agent": news_random_user_agent
+    }
+    url = 'https://www.f1news.ru'
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=news_headers) as response:
+            res = await response.text()
+    soup = BeautifulSoup(res, 'lxml')
+
+    link = soup.find(class_='b-news-list__title')
+    absolute_link= ''
+    if link:
+        link = link.get('href')
+        absolute_link = urljoin(url, link)
+    if absolute_link:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(absolute_link, headers=headers) as response:
+                res = await response.text()
+        soup = BeautifulSoup(res, 'lxml')
+
+        title = soup.find('div', class_='post_head').text
+        text = soup.find('div', class_='post_content post_auto').text
+
+        title = '\n'.join([line.strip() for line in title.splitlines() if line.strip()][:-1])
+        text = '\n\n'.join(text.split('\n'))
+
+        if os.path.exists('last_news.txt'):
+            with open('last_news.txt', 'r', encoding='utf-8') as f:
+                last_news = f.read()
+        else:
+            last_news = ''
+        if last_news != title:
+                await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=title + text
+                    )
+                with open('last_news.txt', 'w', encoding='utf-8') as f:
+                    f.write(title)
+
+async def unsubscribe_from_news(update, context):
+    context.user_data['subscribe_to_news'] = False
+
+    chat_id = update.effective_chat.id
+    name = f'news_{str(chat_id)}'
+    jobs = context.job_queue.get_jobs_by_name(name)
+    if jobs:
+        for job in jobs:
+            job.schedule_removal()
+        await update.message.reply_text('Подписка на новости отключена!')
+    else:
+        await update.message.reply_text('Вы не были подписаны на новостную рассылку')
 
 def main():
     persistence = PicklePersistence(filepath="bot_data.pickle")
@@ -538,7 +716,7 @@ def main():
     application.add_handler(conv_handler_search)
 
     conv_handler_reminder = ConversationHandler(
-        entry_points=[CommandHandler('start', start)],  # start как точка входа
+        entry_points=[CommandHandler('start', start)],
         states={
             WAITING_FOR_REMINDER: [
                 CallbackQueryHandler(reminder_callback),  # обработчик кнопок
@@ -551,24 +729,45 @@ def main():
     )
     application.add_handler(conv_handler_reminder)
 
+    conv_handler_game = ConversationHandler(
+        entry_points=[CommandHandler('play', game_start)],
+        states={
+            WAITING_FOR_GAME: [
+                CallbackQueryHandler(play_game),
+            ],
+            CHECKING_RESPONSE: [
+                CallbackQueryHandler(checking_response),
+                MessageHandler(filters.COMMAND, bad_game_commands),
+            ]
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+    )
+    application.add_handler(conv_handler_game)
+
     application.add_handler(CommandHandler("calendar", print_the_calendar))
     application.add_handler(CommandHandler("top_leaders", print_top_leaders))
     application.add_handler(CommandHandler("pilots", print_pilots))
     application.add_handler(CommandHandler("help", help))
     application.add_handler(CommandHandler("stop_reminder", stop_reminder))
+    application.add_handler(CommandHandler("subscribe_to_news", subscribe_to_news))
+    application.add_handler(CommandHandler("unsubscribe_from_news", unsubscribe_from_news))
+
 
     application.job_queue.run_repeating(
         find_the_calendar,
         interval=3600,  # раз в час
         first=10
     )
-
     application.job_queue.run_repeating(
         find_the_top_leaders,
         interval=3600,  # раз в час
-        first=10
+        first=20
     )
-
+    application.job_queue.run_repeating(
+        find_pilots,
+        interval=3600,  # раз в час
+        first=30
+    )
     application.run_polling()
 
 
