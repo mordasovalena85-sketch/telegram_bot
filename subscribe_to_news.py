@@ -1,3 +1,4 @@
+import json
 import os
 from urllib.parse import urljoin
 
@@ -56,23 +57,25 @@ async def newsletter(context):
         except AttributeError:
             return
 
+        if os.path.exists('data/last_news.json'):
+            with open('data/last_news.json', 'r', encoding='utf-8') as f:
+                last_news_dict = json.load(f)
+        else:
+            last_news_dict = {}
+
         title = [line.strip() for line in title.splitlines() if line.strip()]
         text = '\n\n'.join(text.split('\n'))
 
-        # проверяем последнюю отправленную новость
-        if os.path.exists('data/last_news.txt'):
-            with open('data/last_news.txt', 'r', encoding='utf-8') as f:
-                last_news = f.read()
-        else:
-            last_news = ''
-        if last_news != title[0]:
+        last_title_for_user = last_news_dict.get(str(chat_id), '')
+
+        if last_title_for_user != title[0]:
             await context.bot.send_message(
-                chat_id=chat_id,
-                text='\n'.join(title[:-1]) + text
-            )
-            # записываем последнюю отправленную новость, чтобы не повторять их при отправке
-            with open('data/last_news.txt', 'w', encoding='utf-8') as f:
-                f.write(title[0])
+                    chat_id=chat_id,
+                    text='\n'.join(title[:-1]) + text
+                )
+            last_news_dict[str(chat_id)] = title[0]
+            with open('data/last_news.json', 'w', encoding='utf-8') as f:
+                    json.dump(last_news_dict, f, ensure_ascii=False, indent=4)
 
 
 async def unsubscribe_from_news(update, context):
